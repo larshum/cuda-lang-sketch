@@ -42,6 +42,38 @@ def spmv_triton_wrap(A, x, block_sz):
   spmv_triton_kernel[grid](A.values(), A.crow_indices(), A.col_indices(), x, y, BLOCK_SIZE=block_sz)
   return y
 
+# Alternative Triton kernel where we assume the BLOCK_SIZE has been chosen
+# based on the maximum number of non-zeros across any row of the input matrix.
+# We can therefore omit the loop. However, this version does not perform well
+# either - this is most likely because of the variance between rows - the CUDA
+# code is flexible in the sense that different blocks can execute different
+# amount of code, whereas they all run the same amount (resulting in lots of
+# unnecessary computations).
+#
+# Also, this approach might be rather inefficient in practice if we have
+# matrices with varying number of max non-zeros per row, because the kernel
+# would need to be recompiled for every block size.
+@triton.jit
+def spmv_triton_precompute_kernel(
+    A_values, A_rows, A_cols, x_ptr, y_ptr, BLOCK_SIZE : tl.constexpr):
+  row_idx = tl.program_id(axis=0)
+  curr_row_idx = tl.load(A_rows + row_idx)
+  next_row_idx = tl.load(A_rows + row_idx + 1)
+  indices = curr_row_idx + tl.arange(0, BLOCK_SIZE)
+  mask = indices < next_row_idx
+  values = tl.load(A_values + indices, mask=mask)
+  cols = tl.load(A_cols + indices, mask=mask)
+  x = tl.load(x_ptr + cols, mask=mask)
+  s = tl.sum(values * x)
+  tl.store(y_ptr + row_idx, s)
+
+def spmv_triton_precompute_wrap(A, x, block_sz):
+  N = len(A.crow_indices()) - 1
+  y = torch.empty(N, dtype=torch.float32, device='cuda', requires_grad=False)
+  grid = lambda meta: (N, )
+  spmv_triton_precompute_kernel[grid](A.values(), A.crow_indices(), A.col_indices(), x, y, BLOCK_SIZE=block_sz)
+  return y
+
 # Ignore the Sparse CSR warning
 import warnings
 warnings.filterwarnings('ignore', '.*Sparse CSR tensor support is in beta state.*')
@@ -98,7 +130,23 @@ for block_sz in [2**x for x in range(1, 12)]:
     y_triton = spmv_triton_wrap(A, x, block_sz)
   end.record()
   torch.cuda.synchronize()
-  print(f"Triton[{block_sz}] {start.elapsed_time(end)} ms")
+  print(f"Triton1[{block_sz}] {start.elapsed_time(end)} ms")
+
+# Triton (with precomputed max non-zeroes across any row)
+
+# Precompute the maximum number of non-zero elements in any row, and
+# determine the block size based on this.
+max_nnz = max([y - x for x, y in zip(A.crow_indices()[:-1], A.crow_indices()[1:])])
+block_sz = int(triton.next_power_of_2(max_nnz))
+
+y_triton2 = spmv_triton_precompute_wrap(A, x, block_sz)
+start.record()
+for i in range(10):
+  y_triton2 = spmv_triton_precompute_wrap(A, x, block_sz)
+end.record()
+torch.cuda.synchronize()
+print(f"Triton2 {start.elapsed_time(end)} ms")
 
 assert torch.allclose(y_torch, y_triton, atol=1e-5), f"{y_torch} != {y_triton}"
 assert torch.allclose(y, y_torch, atol=1e-5), f"{y} != {y_torch}"
+assert torch.allclose(y_triton, y_triton2, atol=1e-5)
