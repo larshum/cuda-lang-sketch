@@ -89,7 +89,8 @@ end = torch.cuda.Event(enable_timing=True)
 # Read the expected values given as output from the Trellis model.
 expected = read_expected("data/expected.txt")
 
-probs = forward(hmm, seqs)
+for i in range(10):
+  probs = forward(hmm, seqs)
 start.record()
 for i in range(10):
   probs = forward(hmm, seqs)
@@ -99,7 +100,8 @@ print(f"Naive {start.elapsed_time(end)} ms")
 
 assert torch.allclose(probs, expected), f"{probs}\n{expected}"
 
-probs = forward_merged(hmm, seqs)
+for i in range(10):
+  probs = forward_merged(hmm, seqs)
 start.record()
 for i in range(10):
   probs = forward_merged(hmm, seqs)

@@ -38,35 +38,37 @@ task forward_init(HMM hmm, ObsSeqs seqs, f32 *alpha_src) {
   }
 }
 
-task forward_step(HMM hmm, ObsSeqs seqs, f32 *alpha1, f32 *alpha2, i64 t, f32 neginf) {
+task forward_steps(HMM hmm, ObsSeqs seqs, f32 *alpha1, f32 *alpha2, f32 neginf) {
   i64 instance = task_index;
-  f64 *alpha_src;
-  f64 *alpha_dst;
-  if (t & 1) {
-    alpha_src = alpha1;
-    alpha_dst = alpha2;
-  } else {
-    alpha_src = alpha2;
-    alpha_dst = alpha1;
-  }
-  parallel for state in 0 to 1024 {
-    i64 idx = instance * 1024 + state;
-    if (t < seqs.lens[instance]) {
-      u8 o = seqs.data[instance * seqs.maxlen + t];
-      f32 probs[5];
-      i64 pidx = forward_prob_predecessors(alpha_prev, instance, state, probs);
-      while (pidx < 5) {
-        probs[pidx] = neginf;
-        pidx = pidx + 1;
+  for t in 1 to seqs.maxlen {
+    f64 *alpha_src;
+    f64 *alpha_dst;
+    if (t & 1) {
+      alpha_src = alpha1;
+      alpha_dst = alpha2;
+    } else {
+      alpha_src = alpha2;
+      alpha_dst = alpha1;
+    }
+    parallel for state in 0 to 1024 {
+      i64 idx = instance * 1024 + state;
+      if (t < seqs.lens[instance]) {
+        u8 o = seqs.data[instance * seqs.maxlen + t];
+        f32 probs[5];
+        i64 pidx = forward_prob_predecessors(alpha_prev, instance, state, probs);
+        while (pidx < 5) {
+          probs[pidx] = neginf;
+          pidx = pidx + 1;
+        }
+        alpha_curr[idx] = log_sum_exp(probs, neginf) + hmm.output_prob[o * 64 + state % 64];
+      } else if (t == seqs.lens[instance]) {
+        alpha_curr[idx] = alpha_prev[idx];
       }
-      alpha_curr[idx] = log_sum_exp(probs, neginf) + hmm.output_prob[o * 64 + state % 64];
-    } else if (t == seqs.lens[instance]) {
-      alpha_curr[idx] = alpha_prev[idx];
     }
   }
 }
 
-task forward_max(HMM hmm, ObsSeqs seqs, f32 *alpha1, f32 *alpha2, f32 neginf, f32 *result) {
+task forward_lse(ObsSeqs seqs, f32 *alpha1, f32 *alpha2, f32 neginf, f32 *result) {
   // We read from the alpha array last written to, which we determine based on
   // the maximum length.
   f32 *alpha;
@@ -83,22 +85,8 @@ task forward_max(HMM hmm, ObsSeqs seqs, f32 *alpha1, f32 *alpha2, f32 neginf, f3
     maxp = max_f32(maxp, alpha[ofs + state]);
   }
 
-  // Write the maximum probability to global memory.
-  result[task_index] = maxp;
-}
-
-task forward_lse(ObsSeqs seqs, f32 *alpha1, f32 *alpha2, f32 neginf, f32 *result) {
-  f32 *alpha;
-  if (seqs.maxlen & 1) {
-    alpha = alpha1;
-  } else {
-    alpha = alpha2;
-  }
-
   // Compute the sum of the exponentiated probabilities subtracted by the
   // maximum probability.
-  i64 ofs = task_index * 1024;
-  f32 maxp = result[task_index];
   f32 psum = 0.0;
   parallel for state in 0 to 1024 {
     psum = add_f32(psum, exp_f32(alpha[ofs + state] - maxp));
@@ -112,14 +100,17 @@ fn forward(HMM hmm, ObsSeqs seqs, f32 *result, f32 *alpha1, f32 *alpha2) {
   f32 neginf = -1.0 / 0.0;
 
   // Initialization step
+  @gpu_blocks_per_task=1
+  @gpu_threads_per_block=1024
   launch forward_init[seqs.num_instances](hmm, seqs, alpha1);
 
-  // Forward step
-  for t in 1 to seqs.maxlen {
-    launch forward_step[seqs.num_instances](hmm, seqs, alpha1, alpha2, t, neginf);
-  }
+  // Forward steps
+  @gpu_blocks_per_task=1
+  @gpu_threads_per_block=1024
+  launch forward_steps[seqs.num_instances](hmm, seqs, alpha1, alpha2, neginf);
 
   // LogSumExp step
-  launch forward_max[seqs.num_instances](hmm, seqs, alpha1, alpha2, neginf, result);
-  launch forward_lse[seqs.num_instances](seqs, alpha1, alpha2, neginf, result);
+  @gpu_blocks_per_task=1
+  @gpu_threads_per_block=512
+  launch forward_lse[seqs.num_instances](hmm, seqs, alpha1, alpha2, neginf, result);
 }
