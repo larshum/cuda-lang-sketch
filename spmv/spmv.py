@@ -100,14 +100,14 @@ x = torch.randn(M, dtype=torch.float32, device='cuda', requires_grad=False)
 start = torch.cuda.Event(enable_timing=True)
 end = torch.cuda.Event(enable_timing=True)
 
-# Sanity check
+# Sanity check (GPU)
 y_torch = A.matmul(x)
 start.record()
 for i in range(10):
   y_torch = A.matmul(x)
 end.record()
 torch.cuda.synchronize()
-print(f"Torch {start.elapsed_time(end)} ms")
+print(f"Torch (GPU) {start.elapsed_time(end)} ms")
 
 # Calling the "generated" code from our IR.
 A_cu = CSRMatrix(A.values(), A.crow_indices(), A.col_indices(), len(A.values()), N, M)
@@ -131,6 +131,7 @@ for block_sz in [2**x for x in range(1, 12)]:
   end.record()
   torch.cuda.synchronize()
   print(f"Triton1[{block_sz}] {start.elapsed_time(end)} ms")
+  assert torch.allclose(y_torch, y_triton, atol=1e-5), f"{y_torch} != {y_triton}"
 
 # Triton (with precomputed max non-zeroes across any row)
 
@@ -147,6 +148,16 @@ end.record()
 torch.cuda.synchronize()
 print(f"Triton2 {start.elapsed_time(end)} ms")
 
-assert torch.allclose(y_torch, y_triton, atol=1e-5), f"{y_torch} != {y_triton}"
-assert torch.allclose(y, y_torch, atol=1e-5), f"{y} != {y_torch}"
-assert torch.allclose(y_triton, y_triton2, atol=1e-5)
+# PyTorch on CPU
+A.cpu()
+x.cpu()
+y_torch_cpu = A.matmul(x)
+t0 = time.time_ns()
+for i in range(10):
+  y_torch_cpu = A.matmul(x)
+t1 = time.time_ns()
+print(f"Torch (CPU) {(t1-t0)/1e6} ms")
+y_torch_cpu.cuda()
+
+assert torch.allclose(y_torch, y, atol=1e-5), f"{y_torch} != {y}"
+assert torch.allclose(y_torch, y_torch_cpu, atol=1e-5), f"{y_torch} != {y_torch_cpu}"
