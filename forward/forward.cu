@@ -6,23 +6,24 @@ __device__
 extern float log_sum_exp(float *probs, float neginf);
 
 __device__
-extern int64_t forward_prob_predecessors(HMM hmm, float *alpha_prev, int64_t instance, uint16_t state, float *probs);
+extern int64_t forward_prob_predecessors(HMM hmm, float *alpha_prev, int64_t instance, uint32_t state, float *probs);
 
-template <unsigned int block_size>
+template <int num_states, unsigned int block_size>
 __global__
 void forward_init(HMM hmm, ObsSeqs seqs, float *alpha_src) {
   int64_t task_index = blockIdx.x;
   int64_t instance = task_index;
   uint8_t o = seqs.data[instance * seqs.maxlen];
-  for (int64_t state = threadIdx.x; state < 1024; state += block_size) {
-    alpha_src[instance * 1024 + state] = hmm.initial_prob[state] + hmm.output_prob[o * 64 + state % 64];
+  for (int64_t state = threadIdx.x; state < num_states; state += block_size) {
+    alpha_src[instance * num_states + state] = initial_prob(hmm, state) + output_prob<num_states>(hmm, state, o);
   }
 }
 
-template <unsigned int block_size>
+template <int num_states, unsigned int block_size>
 __global__
 void forward_step(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, int64_t t, float neginf) {
   int64_t task_index = blockIdx.x;
+  if (num_states == 262144) task_index = task_index / 16;
   int64_t instance = task_index;
   float *alpha_src, *alpha_dst;
   if (t & 1) {
@@ -32,29 +33,31 @@ void forward_step(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, int64_t t
     alpha_src = alpha2;
     alpha_dst = alpha1;
   }
-  for (int64_t state = threadIdx.x; state < 1024; state += block_size) {
-    int64_t idx = instance * 1024 + state;
+  int64_t state = threadIdx.x;
+  if (num_states == 262144) state += (blockIdx.x % 16) * blockDim.x;
+  for (; state < num_states; state += block_size) {
+    int64_t idx = instance * num_states + state;
     if (t < seqs.lens[instance]) {
       uint8_t o = seqs.data[instance * seqs.maxlen + t];
       float probs[5];
-      int64_t pidx = forward_prob_predecessors(hmm, alpha_src, instance, state, probs);
+      int64_t pidx = forward_prob_predecessors<num_states>(hmm, alpha_src, instance, state, probs);
       while (pidx < 5) {
         probs[pidx] = neginf;
         pidx = pidx + 1;
       }
-      alpha_dst[idx] = log_sum_exp(probs, neginf) + hmm.output_prob[o * 64 + state % 64];
+      alpha_dst[idx] = log_sum_exp(probs, neginf) + output_prob<num_states>(hmm, state, o);
     } else if (t == seqs.lens[instance]) {
       alpha_dst[idx] = alpha_src[idx];
     }
   }
 }
 
-template <unsigned int block_size>
+template <int num_states, unsigned int block_size>
 __global__
 void forward_steps(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, float neginf) {
   int64_t task_index = blockIdx.x;
   int64_t instance = task_index;
-  for (int64_t t = 1; t < seqs.maxlen; t++) {
+  for (int64_t t = 1; t <= seqs.lens[instance]; t++) {
     float *alpha_src, *alpha_dst;
     if (t & 1) {
       alpha_src = alpha1;
@@ -63,18 +66,18 @@ void forward_steps(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, float ne
       alpha_src = alpha2;
       alpha_dst = alpha1;
     }
-    for (int64_t state = threadIdx.x; state < 1024; state += block_size) {
-      int64_t idx = instance * 1024 + state;
+    for (int64_t state = threadIdx.x; state < num_states; state += block_size) {
+      int64_t idx = instance * num_states + state;
       if (t < seqs.lens[instance]) {
         uint8_t o = seqs.data[instance * seqs.maxlen + t];
         float probs[5];
-        int64_t pidx = forward_prob_predecessors(hmm, alpha_src, instance, state, probs);
+        int64_t pidx = forward_prob_predecessors<num_states>(hmm, alpha_src, instance, state, probs);
         while (pidx < 5) {
           probs[pidx] = neginf;
           pidx = pidx + 1;
         }
-        alpha_dst[idx] = log_sum_exp(probs, neginf) + hmm.output_prob[o * 64 + state % 64];
-      } else if (t == seqs.lens[instance]) {
+        alpha_dst[idx] = log_sum_exp(probs, neginf) + output_prob<num_states>(hmm, state, o);
+      } else {
         alpha_dst[idx] = alpha_src[idx];
       }
     }
@@ -91,7 +94,7 @@ void forward_steps(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, float ne
   }
 }
 
-template <unsigned int block_size>
+template <int num_states, unsigned int block_size>
 __global__
 void forward_lse(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, float neginf, float *result) {
   int64_t task_index = blockIdx.x;
@@ -102,9 +105,9 @@ void forward_lse(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, float negi
     alpha = alpha2;
   }
 
-  int64_t ofs = task_index * 1024;
+  int64_t ofs = task_index * num_states;
   float maxp = neginf;
-  for (int state = threadIdx.x; state < 1024; state += block_size) {
+  for (int state = threadIdx.x; state < num_states; state += block_size) {
     maxp = max(maxp, alpha[ofs + state]);
   }
 
@@ -142,7 +145,7 @@ void forward_lse(HMM hmm, ObsSeqs seqs, float *alpha1, float *alpha2, float negi
   // Compute the sum of exponentiated probabilities subtracted by the maximum
   // probability.
   float psum = 0.0;
-  for (int state = threadIdx.x; state < 1024; state += block_size) {
+  for (int state = threadIdx.x; state < num_states; state += block_size) {
     psum = psum + expf(alpha[ofs + state] - maxp);
   }
 
@@ -204,11 +207,29 @@ void forward(
   seqs.num_instances = seqs_num_instances;
 
   float neginf = -1.0 / 0.0;
-  forward_init<1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
-  for (int64_t t = 1; t < seqs.maxlen; t++) {
-    forward_step<1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, t, neginf);
+  if (hmm_num_states == 1024) {
+    forward_init<1024, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
+  } else if (hmm_num_states == 16384) {
+    forward_init<16384, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
+  } else if (hmm_num_states == 262144) {
+    forward_init<262144, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
   }
-  forward_lse<512><<<seqs.num_instances, 512>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  for (int64_t t = 1; t < seqs.maxlen; t++) {
+    if (hmm_num_states == 1024) {
+      forward_step<1024, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, t, neginf);
+    } else if (hmm_num_states == 16384) {
+      forward_step<16384, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, t, neginf);
+    } else if (hmm_num_states == 262144) {
+      forward_step<262144, 16*1024><<<16*seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, t, neginf);
+    }
+  }
+  if (hmm_num_states == 1024) {
+    forward_lse<1024, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  } else if (hmm_num_states == 16384) {
+    forward_lse<16384, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  } else if (hmm_num_states == 262144) {
+    forward_lse<262144, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  }
 }
 
 extern "C"
@@ -232,7 +253,17 @@ void forward_merged(
   seqs.num_instances = seqs_num_instances;
 
   float neginf = -1.0 / 0.0;
-  forward_init<1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
-  forward_steps<1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf);
-  forward_lse<512><<<seqs.num_instances, 512>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  if (hmm_num_states == 1024) {
+    forward_init<1024, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
+    forward_steps<1024, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf);
+    forward_lse<1024, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  } else if (hmm_num_states == 16384) {
+    forward_init<16384, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
+    forward_steps<16384, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf);
+    forward_lse<16384, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  } else if (hmm_num_states == 262144) {
+    forward_init<262144, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1);
+    forward_steps<262144, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf);
+    forward_lse<262144, 1024><<<seqs.num_instances, 1024>>>(hmm, seqs, alpha1, alpha2, neginf, result);
+  }
 }
